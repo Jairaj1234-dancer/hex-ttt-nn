@@ -1,0 +1,76 @@
+# Phase 3: Refinement and optimization
+# Timeline: Weeks 11-16
+# Goal: Largest network, Gumbel MuZero search, aggressive reanalysis, final polish.
+
+game:
+  win_length: 6              # 6-in-a-row to win
+  first_turn_stones: 1       # first player places 1 stone on turn 1
+  normal_turn_stones: 2      # each subsequent turn places 2 stones
+
+network:
+  grid_size: 31              # 31x31 hexagonal grid
+  num_blocks: 20             # 20 residual blocks (deepest network)
+  channels: 256              # 256 filters per conv layer
+  in_channels: 12            # input feature planes
+
+mcts:
+  num_simulations: 800       # full MCTS rollouts per move
+  num_simulations_reduced: 100  # reduced rollouts for playout cap
+  cpuct: 1.5                 # exploration constant (tightest setting)
+  dirichlet_alpha: 0.06      # Dirichlet noise (sharpest prior)
+  dirichlet_epsilon: 0.25    # fraction of noise mixed into prior
+  temperature_moves: 20      # half-moves with temperature=1.0
+  temperature_mid_moves: 40  # half-moves before switching to final temperature
+  temperature_mid: 0.5       # intermediate temperature
+  temperature_final: 0.1     # near-greedy in endgame
+  fpu_reduction: -0.2        # first-play urgency: slight optimism for unvisited nodes
+  zoi_margin: 3              # zone-of-interest margin around occupied cells
+  virtual_loss: 3            # virtual loss for parallel MCTS
+  num_threads: 4             # parallel search threads
+  batch_size: 64             # neural network evaluation batch size
+  use_gumbel: true           # enable Gumbel AlphaZero / MuZero-style search
+  gumbel_top_k: 16           # top-k actions for Gumbel sequential halving
+
+training:
+  num_iterations: 300        # total training iterations
+  games_per_iteration: 1500  # self-play games per iteration
+  training_steps_per_iteration: 2000  # gradient steps per iteration
+  async_selfplay: true       # asynchronous self-play and training
+  batch_size: 1024           # training mini-batch size (largest)
+  learning_rate: 0.005       # initial learning rate (lower for fine-tuning)
+  lr_schedule: cosine_warm_restarts  # cosine annealing with warm restarts
+  lr_min: 0.00005            # minimum learning rate
+  lr_restart_period: 50000   # steps between warm restarts
+  weight_decay: 0.0001       # L2 regularization
+  momentum: 0.9              # SGD momentum
+  optimizer: sgd             # optimizer type
+  replay_buffer_size: 50000  # max games stored in replay buffer (largest)
+
+  ownership_weight: 0.15     # weight for cell ownership prediction head
+  threat_weight: 0.15        # weight for threat/connection prediction head
+  augment_d6: true           # apply D6 symmetry augmentation
+  max_grad_norm: 1.0         # gradient clipping threshold
+  value_weight: 1.0          # loss weight for value head
+  policy_weight: 1.0         # loss weight for policy head
+
+  # Multi-scale training: shifted weight toward larger boards
+  multi_scale:
+    enabled: true
+    sizes: [19, 25, 31]      # board sizes to train on
+    weights: [0.2, 0.4, 0.4] # more emphasis on 25 and 31
+
+evaluation:
+  games: 400                 # evaluation games between candidate and current best
+  win_threshold: 0.55        # win rate needed to replace current best
+  checkpoint_interval: 10    # save checkpoint every N iterations
+
+playout_cap:
+  enabled: true              # playout cap randomization enabled
+  full_ratio: 0.25           # 25% of moves get full simulations
+  reduced_ratio: 0.75        # 75% of moves get reduced simulations
+
+reanalysis:
+  enabled: true              # re-evaluate old positions with latest network
+  interval: 5                # every 5 training steps (more aggressive than phase 2)
+  batch_size: 128            # positions to reanalyze per batch (doubled from phase 2)
+  value_blend_weight: 0.3    # blend weight for network value estimate vs original outcome

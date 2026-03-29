@@ -1,0 +1,56 @@
+# Phase 1: Prototype - validate pipeline end-to-end
+# Timeline: Weeks 1-3
+# Goal: Get the full train/self-play/evaluate loop working on a smaller network.
+
+game:
+  win_length: 6              # 6-in-a-row to win
+  first_turn_stones: 1       # first player places 1 stone on turn 1
+  normal_turn_stones: 2      # each subsequent turn places 2 stones
+
+network:
+  grid_size: 19              # 19x19 hexagonal grid (prototype scale)
+  num_blocks: 8              # 8 residual blocks
+  channels: 128              # 128 filters per conv layer
+  in_channels: 12            # input feature planes
+
+mcts:
+  num_simulations: 200       # MCTS rollouts per move
+  cpuct: 2.5                 # exploration constant (higher = more exploration)
+  dirichlet_alpha: 0.10      # Dirichlet noise parameter for root
+  dirichlet_epsilon: 0.25    # fraction of noise mixed into prior
+  temperature_moves: 10      # half-moves with temperature=1.0
+  temperature_final: 0.3     # temperature after threshold
+  fpu_reduction: 0.0         # first-play urgency reduction (disabled for phase 1)
+  zoi_margin: 3              # zone-of-interest margin around occupied cells
+  virtual_loss: 3            # virtual loss for parallel MCTS
+  num_threads: 4             # parallel search threads
+  batch_size: 32             # neural network evaluation batch size
+
+training:
+  num_iterations: 100        # total training iterations
+  games_per_iteration: 500   # self-play games per iteration
+  training_steps_per_iteration: 500  # gradient steps per iteration
+  batch_size: 256            # training mini-batch size
+  learning_rate: 0.02        # initial learning rate
+  lr_schedule: cosine        # cosine annealing schedule
+  lr_min: 0.0002             # minimum learning rate
+  weight_decay: 0.0001       # L2 regularization
+  momentum: 0.9              # SGD momentum
+  optimizer: sgd             # optimizer type
+  replay_buffer_size: 5000   # max games stored in replay buffer
+  augment_d6: true           # apply D6 symmetry augmentation (hex rotations + reflections)
+  max_grad_norm: 1.0         # gradient clipping threshold
+  value_weight: 1.0          # loss weight for value head
+  policy_weight: 1.0         # loss weight for policy head
+
+  # Auxiliary loss weights
+  ownership_weight: 0.10     # weight for cell ownership prediction head
+  threat_weight: 0.10        # weight for threat/connection prediction head
+
+evaluation:
+  games: 200                 # evaluation games between candidate and current best
+  win_threshold: 0.55        # win rate needed to replace current best
+  checkpoint_interval: 10    # save checkpoint every N iterations
+
+playout_cap:
+  enabled: false             # playout cap randomization disabled for phase 1
