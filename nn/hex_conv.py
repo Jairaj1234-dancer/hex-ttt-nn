@@ -3,12 +3,19 @@
 On a brick-wall (even-r offset) layout, a standard 3x3 convolution kernel
 captures 8 cells around the center.  Six of these correspond to true hex
 neighbors; the remaining two are the diagonally-opposite "non-neighbor"
-corners.  This is a well-known and accepted approximation -- the slight
-contamination from two non-neighbor cells is negligible in practice and
-avoids the complexity of custom sparse kernels.
+corners.
 
-The module provides:
-    - :class:`HexResBlock`: standard pre-activation residual block.
+This module provides :class:`HexConv2d`, a Conv2d subclass that masks out
+the two non-hex-neighbor corners of the 3x3 kernel (positions [0,0] and
+[2,2] in the kernel tensor).  This ensures the network operates strictly
+on the Z[omega] lattice neighborhood, encoding geometry (structural
+substrate) without leaking information from non-adjacent cells.
+
+Inspired by the hexgo project (github.com/sub-surface/hexgo) which frames
+the hex grid as an Eisenstein integer ring and masks the kernel accordingly.
+
+The module also provides:
+    - :class:`HexResBlock`: residual block using ``HexConv2d``.
     - :class:`HexResNet`: full ResNet backbone with KataGo-style global
       pooling so that the network can reason about whole-board features
       (e.g. material count, global threat level) alongside local patterns.
@@ -21,22 +28,53 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class HexConv2d(nn.Conv2d):
+    """Conv2d with a Z[omega] kernel mask for hex grids.
+
+    On an axial-coordinate brick-wall layout, a 3x3 kernel covers 9 cells
+    but only 6 are true hex neighbors (plus center).  Positions [0,0] and
+    [2,2] correspond to the two non-adjacent diagonal corners.  This layer
+    registers a persistent mask that zeros those kernel weights before every
+    forward pass, ensuring the convolution respects hex geometry exactly.
+
+    The mask pattern (1 = active, 0 = masked)::
+
+        0 1 1
+        1 1 1
+        1 1 0
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, bias: bool = False) -> None:
+        super().__init__(in_channels, out_channels, kernel_size=3, padding=1, bias=bias)
+        # Build the hex mask: all 1s except corners [0,0] and [2,2]
+        mask = torch.ones(1, 1, 3, 3)
+        mask[0, 0, 0, 0] = 0.0
+        mask[0, 0, 2, 2] = 0.0
+        self.register_buffer("hex_mask", mask)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Zero non-hex-neighbor kernel weights before convolution
+        masked_weight = self.weight * self.hex_mask
+        return F.conv2d(x, masked_weight, self.bias, self.stride, self.padding)
+
+
 class HexResBlock(nn.Module):
-    """Standard residual block for hex-grid feature maps.
+    """Residual block using hex-masked convolutions.
 
     Architecture::
 
-        x ─┬─ Conv3x3 ─ BN ─ ReLU ─ Conv3x3 ─ BN ─┬─ ReLU ─ out
-           └────────────── skip ────────────────────┘
+        x ─┬─ HexConv3x3 ─ BN ─ ReLU ─ HexConv3x3 ─ BN ─┬─ ReLU ─ out
+           └──────────────── skip ────────────────────────┘
 
-    Padding is ``same`` so spatial dimensions are preserved.
+    Padding is ``same`` so spatial dimensions are preserved.  Both
+    convolutions use the Z[omega] kernel mask to respect hex geometry.
     """
 
     def __init__(self, channels: int) -> None:
         super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.conv1 = HexConv2d(channels, channels, bias=False)
         self.bn1 = nn.BatchNorm2d(channels)
-        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
+        self.conv2 = HexConv2d(channels, channels, bias=False)
         self.bn2 = nn.BatchNorm2d(channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

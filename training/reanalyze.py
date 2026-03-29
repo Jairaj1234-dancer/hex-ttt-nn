@@ -131,7 +131,7 @@ class Reanalyzer:
             try:
                 # Re-run MCTS on this position
                 with torch.no_grad():
-                    _, new_policy_dict = mcts.get_move(
+                    _, new_policy_dict, _ = mcts.get_move(
                         game_state, temperature=1.0
                     )
 

@@ -281,23 +281,88 @@ class MCTS:
         self,
         game_state: GameState,
         temperature: Optional[float] = None,
-    ) -> Tuple[HexCoord, Dict[HexCoord, float]]:
-        """Convenience method: run search and return the best move and policy.
+        prev_root: Optional[MCTSNode] = None,
+    ) -> Tuple[HexCoord, Dict[HexCoord, float], MCTSNode]:
+        """Run search and return the best move, policy, and new root.
+
+        Supports **tree reuse** (inspired by hexgo): if ``prev_root`` is
+        provided, the search attempts to find the subtree matching the
+        current game state among the previous root's children/grandchildren.
+        If found, this subtree becomes the new root with its accumulated
+        statistics, saving ~sims/branching_factor work for free.
 
         Args:
             game_state: the current game state.
             temperature: move selection temperature.  If ``None``, uses the
                 value from ``self.config['temperature']``.
+            prev_root: optional root from a previous search call, enabling
+                tree reuse.
 
         Returns:
-            ``(best_move, policy_dict)`` where ``best_move`` is the selected
-            HexCoord and ``policy_dict`` maps moves to their visit-count
-            probabilities.
+            ``(best_move, policy_dict, root_node)`` where ``root_node`` can
+            be passed as ``prev_root`` to the next call.
         """
         if temperature is None:
             temperature = self.config.get("temperature", 0.0)
 
-        root, policy = self.search(game_state)
+        # Tree reuse: try to find the current state in the previous tree
+        reused = False
+        if prev_root is not None and prev_root.children:
+            # Search one or two levels deep (to cover both sub-moves
+            # within the same turn)
+            for child in prev_root.children.values():
+                if child.game_state.board.hash == game_state.board.hash:
+                    child.parent = None  # detach from old tree (GC)
+                    root, policy = self._search_from_existing(child)
+                    reused = True
+                    break
+                # Check grandchildren (covers opponent's response)
+                if child.children:
+                    for grandchild in child.children.values():
+                        if grandchild.game_state.board.hash == game_state.board.hash:
+                            grandchild.parent = None
+                            root, policy = self._search_from_existing(grandchild)
+                            reused = True
+                            break
+                    if reused:
+                        break
+
+        if not reused:
+            root, policy = self.search(game_state)
+
         best_move = root.get_best_move(temperature=temperature)
 
-        return best_move, policy
+        return best_move, policy, root
+
+    def _search_from_existing(self, node: MCTSNode) -> Tuple[MCTSNode, Dict[HexCoord, float]]:
+        """Continue MCTS from an existing node (tree reuse).
+
+        Re-applies Dirichlet noise to the reused root and runs the
+        remaining simulations.
+        """
+        num_simulations: int = self.config.get("num_simulations", 200)
+        cpuct: float = self.config.get("cpuct", 2.5)
+        fpu_reduction: float = self.config.get("fpu_reduction", 0.0)
+        dirichlet_alpha: float = self.config.get("dirichlet_alpha", 0.10)
+        dirichlet_epsilon: float = self.config.get("dirichlet_epsilon", 0.25)
+
+        # Re-apply Dirichlet noise for fresh exploration
+        if node.children:
+            self._add_dirichlet_noise(node, dirichlet_alpha, dirichlet_epsilon)
+
+        # Run additional simulations (subtract already-accumulated visits)
+        remaining = max(0, num_simulations - node.visit_count)
+        for _ in range(remaining):
+            leaf = self._select_leaf(node, cpuct, fpu_reduction)
+            if leaf.is_terminal:
+                gs = leaf.game_state
+                if gs.winner is not None:
+                    value = 1.0 if gs.winner == gs.current_player else -1.0
+                else:
+                    value = 0.0
+            else:
+                value = self._evaluate_and_expand(leaf)
+            leaf.backup(value)
+
+        policy = node.get_visit_distribution()
+        return node, policy

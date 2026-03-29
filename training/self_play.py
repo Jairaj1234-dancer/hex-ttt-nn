@@ -141,23 +141,33 @@ class SelfPlayWorker:
 
         Half-move numbering starts at 0.
 
-        Temperature schedule:
-            - For the first ``temperature_moves`` half-moves: tau = 1.0
-            - If ``temperature_mid`` is configured, for half-moves between
-              ``temperature_moves`` and ``temperature_mid_moves``: tau = temperature_mid
-            - Beyond that: tau = temperature_final
+        Uses cosine annealing for a smooth temperature decay (inspired by
+        hexgo): ``tau = max(tau_final, cos(pi * half_move / horizon))``.
+        This avoids the sharp cliff of a step schedule and produces a more
+        natural exploration-to-exploitation transition.
+
+        Falls back to the legacy step schedule if ``temperature_schedule``
+        is set to ``"step"`` in the config.
         """
-        if half_move < self.temperature_moves:
-            return 1.0
+        schedule = self.config.get("mcts", {}).get("temperature_schedule", "cosine")
 
-        if (
-            self.temperature_mid is not None
-            and self.temperature_mid_moves is not None
-            and half_move < self.temperature_mid_moves
-        ):
-            return self.temperature_mid
+        if schedule == "step":
+            # Legacy step schedule
+            if half_move < self.temperature_moves:
+                return 1.0
+            if (
+                self.temperature_mid is not None
+                and self.temperature_mid_moves is not None
+                and half_move < self.temperature_mid_moves
+            ):
+                return self.temperature_mid
+            return self.temperature_final
 
-        return self.temperature_final
+        # Cosine annealing (default)
+        import math
+        horizon = self.temperature_moves * 3  # full cosine period
+        tau = math.cos(math.pi * half_move / horizon)
+        return max(self.temperature_final, tau)
 
     def _get_num_simulations(self) -> int:
         """Get the number of MCTS simulations for the current move.
@@ -205,6 +215,7 @@ class SelfPlayWorker:
         # Create MCTS instance with current network
         mcts_config = dict(self.config.get("mcts", {}))
         mcts = MCTS(self.network, mcts_config)
+        prev_root = None  # For tree reuse between moves
 
         self.network.eval()
 
@@ -222,10 +233,10 @@ class SelfPlayWorker:
             num_sims = self._get_num_simulations()
             mcts_config["num_simulations"] = num_sims
 
-            # Run MCTS search and get move + policy
+            # Run MCTS search with tree reuse
             with torch.no_grad():
-                move, policy_dict = mcts.get_move(
-                    game_state, temperature=temperature
+                move, policy_dict, prev_root = mcts.get_move(
+                    game_state, temperature=temperature, prev_root=prev_root
                 )
 
             # Convert policy dict to flat grid array
@@ -254,18 +265,24 @@ class SelfPlayWorker:
                 )
                 break
 
-        # Assign value targets based on game outcome
+        # Assign value targets based on game outcome.
+        # Uses TD-lambda discounted targets (inspired by hexgo):
+        #   z_t = gamma^(T-1-t) * z_final
+        # Early positions receive a discounted signal, making them "less
+        # certain" — this helps the value head converge faster by not
+        # over-fitting early game positions to the final binary outcome.
         winner = game_state.winner
         game_data: List[dict] = []
+        total_positions = len(trajectory)
+        td_gamma: float = self.config.get("training", {}).get("td_gamma", 0.99)
 
-        for record in trajectory:
+        for t, record in enumerate(trajectory):
             if winner is None:
-                # Draw
                 value = 0.0
-            elif record["current_player"] == winner:
-                value = 1.0
             else:
-                value = -1.0
+                raw_value = 1.0 if record["current_player"] == winner else -1.0
+                discount = td_gamma ** (total_positions - 1 - t)
+                value = discount * raw_value
 
             sample = {
                 "features": record["features"],
