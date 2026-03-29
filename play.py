@@ -177,7 +177,7 @@ def ai_select_move(
     network.eval()
 
     with torch.no_grad():
-        move, policy = mcts.get_move(game_state, temperature=0.0)
+        move, policy, _ = mcts.get_move(game_state, temperature=0.0)
 
     return move, policy
 

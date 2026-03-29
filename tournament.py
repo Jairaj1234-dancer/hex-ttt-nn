@@ -174,6 +174,79 @@ class OnePlyAgent:
         return self.greedy.get_move(game_state)
 
 
+class EisensteinGreedyAgent:
+    """Zero-parameter geometric agent grounded in hex lattice structure.
+
+    Inspired by hexgo's EisensteinGreedyAgent. Scores each candidate move
+    by the maximum chain length it would create (or block) along any of the
+    three Z[omega] axes (the Eisenstein integer unit directions).  With
+    ``defensive=True``, also considers blocking the opponent's best chain.
+
+    This provides a stronger-than-greedy baseline that forces NN agents to
+    learn real tactical patterns rather than just beating random play.
+    """
+
+    def __init__(self, win_length: int = 6, zoi_margin: int = 3, defensive: bool = True):
+        self.win_length = win_length
+        self.zoi_margin = zoi_margin
+        self.defensive = defensive
+
+    def _chain_score(self, board_stones: dict, coord: HexCoord, player: int) -> int:
+        """Score a move by the longest chain it creates along any hex axis."""
+        from game.hex_grid import HEX_AXES
+        best_chain = 0
+        for axis in HEX_AXES:
+            chain = 1
+            # Forward
+            pos = HexCoord(coord.q + axis.q, coord.r + axis.r)
+            while board_stones.get(pos) == player:
+                chain += 1
+                pos = HexCoord(pos.q + axis.q, pos.r + axis.r)
+            # Backward
+            pos = HexCoord(coord.q - axis.q, coord.r - axis.r)
+            while board_stones.get(pos) == player:
+                chain += 1
+                pos = HexCoord(pos.q - axis.q, pos.r - axis.r)
+            best_chain = max(best_chain, chain)
+        return best_chain
+
+    def get_move(self, game_state: GameState) -> HexCoord:
+        moves = game_state.legal_moves(zoi_margin=self.zoi_margin)
+        if not moves:
+            return HexCoord(0, 0)
+
+        player = game_state.current_player
+        opponent = 3 - player
+        board = game_state.board
+
+        best_score = -1
+        best_moves = []
+
+        for move in moves:
+            # Offensive: chain we'd create
+            attack = self._chain_score(board.stones, move, player)
+            score = attack * 3  # weight offensive moves
+
+            if self.defensive:
+                # Defensive: chain opponent would create here
+                defense = self._chain_score(board.stones, move, opponent)
+                score += defense * 2  # slightly less weight on defense
+
+            # Bonus for near-win chains
+            if attack >= self.win_length:
+                score += 1000  # winning move
+            if self.defensive and self._chain_score(board.stones, move, opponent) >= self.win_length:
+                score += 500  # must-block
+
+            if score > best_score:
+                best_score = score
+                best_moves = [move]
+            elif score == best_score:
+                best_moves.append(move)
+
+        return random.choice(best_moves)
+
+
 class MCTSAgent:
     """Neural network agent using MCTS."""
 
@@ -185,7 +258,7 @@ class MCTSAgent:
 
     def get_move(self, game_state: GameState) -> HexCoord:
         with torch.no_grad():
-            move, _ = self.mcts.get_move(game_state, temperature=0.0)
+            move, _, _ = self.mcts.get_move(game_state, temperature=0.0)
         return move
 
 
@@ -232,6 +305,7 @@ class MatchResult:
     winner: int  # 1, 2, or 0 for draw
     num_moves: int
     duration_s: float
+    move_history: List[Tuple[int, int]] = field(default_factory=list)  # [(q, r), ...]
 
 
 def play_match(
@@ -272,12 +346,16 @@ def play_match(
     duration = time.time() - start
     winner = game_state.winner if game_state.winner is not None else 0
 
+    # Extract move history as plain tuples
+    move_history = [(c.q, c.r) for c in game_state.move_history]
+
     return MatchResult(
         player1_name=agent1.name,
         player2_name=agent2.name,
         winner=winner,
         num_moves=half_move,
         duration_s=duration,
+        move_history=move_history,
     )
 
 
@@ -463,6 +541,21 @@ def print_win_matrix(tournament: TournamentResult):
     print()
 
 
+def save_replay(match: MatchResult, output_path: str, game_rules: dict = None):
+    """Save a single game replay as JSON."""
+    replay = {
+        "player1": match.player1_name,
+        "player2": match.player2_name,
+        "winner": match.winner,
+        "num_moves": match.num_moves,
+        "move_history": match.move_history,
+        "rules": game_rules or {"win_length": 6, "first_turn_stones": 1, "normal_turn_stones": 2},
+    }
+    with open(output_path, "w") as f:
+        json.dump(replay, f, indent=2)
+    logger.info("Replay saved to %s", output_path)
+
+
 def save_results(tournament: TournamentResult, output_path: str):
     """Save tournament results as JSON."""
     data = {
@@ -484,6 +577,7 @@ def save_results(tournament: TournamentResult, output_path: str):
                 "winner": m.winner,
                 "num_moves": m.num_moves,
                 "duration_s": round(m.duration_s, 2),
+                "move_history": m.move_history,
             }
             for m in tournament.matches
         ],
@@ -651,7 +745,12 @@ Examples:
         oneply_agent = OnePlyAgent(win_length=win_length, zoi_margin=zoi_margin)
         agents.append(Agent(name="OnePly", get_move=oneply_agent.get_move))
 
-        logger.info("Added baseline agents: Random, Greedy, OnePly")
+        eisenstein_agent = EisensteinGreedyAgent(
+            win_length=win_length, zoi_margin=zoi_margin, defensive=True
+        )
+        agents.append(Agent(name="Eisenstein", get_move=eisenstein_agent.get_move))
+
+        logger.info("Added baseline agents: Random, Greedy, OnePly, Eisenstein")
 
     # Neural network agents
     if not args.no_nn:
@@ -695,6 +794,12 @@ Examples:
 
     # Save results
     save_results(tournament, args.output)
+
+    # Save first and last game replays
+    if tournament.matches:
+        game_rules = {"win_length": win_length, "first_turn_stones": 1, "normal_turn_stones": 2}
+        save_replay(tournament.matches[0], "replay_first.json", game_rules)
+        save_replay(tournament.matches[-1], "replay_last.json", game_rules)
 
     return tournament
 

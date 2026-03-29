@@ -200,7 +200,7 @@ class Evaluator:
 
             # Run MCTS with temperature=0 (greedy)
             with torch.no_grad():
-                move, _ = mcts.get_move(game_state, temperature=0.0)
+                move, _, _ = mcts.get_move(game_state, temperature=0.0)
 
             game_state = game_state.apply_move(move)
             half_move += 1
