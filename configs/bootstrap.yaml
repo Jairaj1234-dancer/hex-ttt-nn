@@ -1,0 +1,65 @@
+# Bootstrap config: supervised pre-training + fast self-play
+# Smaller grid (13x13), tiny network, max speed
+
+game:
+  win_length: 6
+  first_turn_stones: 1
+  normal_turn_stones: 2
+
+network:
+  grid_size: 13               # smaller grid = fewer legal moves = faster convergence
+  num_blocks: 3               # tiny but enough to learn patterns
+  channels: 48
+  in_channels: 12
+
+mcts:
+  num_simulations: 25
+  cpuct: 2.5
+  dirichlet_alpha: 0.15
+  dirichlet_epsilon: 0.25
+  temperature_moves: 6
+  temperature_final: 0.05
+  temperature_schedule: cosine
+  fpu_reduction: 0.0
+  zoi_margin: 2
+  virtual_loss: 3
+  num_threads: 1
+  batch_size: 8
+  max_moves: 40               # tighter cap
+
+bootstrap:
+  num_games: 3000             # Eisenstein vs OnePly games for supervised data
+  epochs: 40                  # supervised training epochs
+  batch_size: 128
+  learning_rate: 0.003
+
+training:
+  num_iterations: 200
+  games_per_iteration: 30
+  training_steps_per_iteration: 100
+  batch_size: 64
+  learning_rate: 0.005        # lower LR for fine-tuning after bootstrap
+  lr_schedule: cosine
+  lr_min: 0.0001
+  weight_decay: 0.0001
+  momentum: 0.9
+  optimizer: sgd
+  replay_buffer_size: 3000
+  augment_d6: true
+  max_grad_norm: 1.0
+  value_weight: 1.0
+  policy_weight: 1.0
+  ownership_weight: 0.05
+  threat_weight: 0.05
+  td_gamma: 0.99
+  curriculum_agent: eisenstein
+  curriculum_ratio: 0.4
+  curriculum_ramp_down: 100
+
+evaluation:
+  games: 20
+  win_threshold: 0.55
+  checkpoint_interval: 10
+
+playout_cap:
+  enabled: false

@@ -1,0 +1,62 @@
+# Curriculum training: NN learns by playing against Eisenstein baseline
+# Tuned for MacBook (MPS) — small network, fast games, many iterations
+# Goal: beat Eisenstein agent, then transition to pure self-play
+
+game:
+  win_length: 6
+  first_turn_stones: 1
+  normal_turn_stones: 2
+
+network:
+  grid_size: 19
+  num_blocks: 4
+  channels: 64
+  in_channels: 12
+
+mcts:
+  num_simulations: 25         # minimal search — forces pattern learning over brute-force
+  cpuct: 2.5
+  dirichlet_alpha: 0.15
+  dirichlet_epsilon: 0.25
+  temperature_moves: 6
+  temperature_final: 0.05
+  temperature_schedule: cosine
+  fpu_reduction: 0.0
+  zoi_margin: 2               # tight play area — forces play near clusters
+  virtual_loss: 3
+  num_threads: 1
+  batch_size: 8
+  max_moves: 60               # games must end within 60 half-moves or draw
+
+training:
+  num_iterations: 200
+  games_per_iteration: 20
+  training_steps_per_iteration: 80
+  batch_size: 64
+  learning_rate: 0.01
+  lr_schedule: cosine
+  lr_min: 0.0001
+  weight_decay: 0.0001
+  momentum: 0.9
+  optimizer: sgd
+  replay_buffer_size: 2000
+  augment_d6: true
+  max_grad_norm: 1.0
+  value_weight: 1.0
+  policy_weight: 1.0
+  ownership_weight: 0.05
+  threat_weight: 0.05
+  td_gamma: 0.99
+
+  # Curriculum settings
+  curriculum_agent: eisenstein
+  curriculum_ratio: 0.3
+  curriculum_ramp_down: 120    # start reducing curriculum at iter 120
+
+evaluation:
+  games: 20
+  win_threshold: 0.55
+  checkpoint_interval: 10
+
+playout_cap:
+  enabled: false

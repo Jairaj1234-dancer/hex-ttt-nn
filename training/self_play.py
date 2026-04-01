@@ -119,6 +119,7 @@ class SelfPlayWorker:
         self.network = network
         self.config = config
         self.grid_size: int = config.get("network", {}).get("grid_size", 19)
+        self.win_length: int = config.get("game", {}).get("win_length", 6)
 
         # MCTS settings
         mcts_cfg = config.get("mcts", {})
@@ -126,6 +127,10 @@ class SelfPlayWorker:
         self.temperature_final: float = mcts_cfg.get("temperature_final", 0.3)
         self.temperature_mid: Optional[float] = mcts_cfg.get("temperature_mid")
         self.temperature_mid_moves: Optional[int] = mcts_cfg.get("temperature_mid_moves")
+
+        # Game length limit — forces the network to find wins fast
+        self.max_moves: int = mcts_cfg.get("max_moves", 1000)
+        self.zoi_margin: int = mcts_cfg.get("zoi_margin", 3)
 
         # Playout cap settings
         playout_cfg = config.get("playout_cap", {})
@@ -208,7 +213,7 @@ class SelfPlayWorker:
         """
         from mcts.search import MCTS
 
-        game_state = GameState()
+        game_state = GameState(win_length=self.win_length)
         trajectory: List[dict] = []
         half_move = 0
 
@@ -258,10 +263,11 @@ class SelfPlayWorker:
             game_state = game_state.apply_move(move)
             half_move += 1
 
-            # Safety: prevent infinite games (very unlikely but defensive)
-            if half_move > 1000:
-                logger.warning(
-                    "Self-play game exceeded 1000 half-moves; terminating as draw."
+            # Force short games — the NN must learn to win quickly
+            if half_move >= self.max_moves:
+                logger.debug(
+                    "Self-play game hit %d move limit; terminating as draw.",
+                    self.max_moves,
                 )
                 break
 
@@ -300,24 +306,195 @@ class SelfPlayWorker:
 
         return game_data
 
-    def play_games(self, num_games: int) -> List[List[dict]]:
-        """Play multiple self-play games.
+    def play_curriculum_game(self, opponent_fn, use_mcts: bool = True) -> Tuple[List[dict], bool]:
+        """Play a game where the NN faces an external opponent.
+
+        Can use either MCTS or raw policy for move selection. Raw policy
+        is useful early in training when the value head is uncalibrated
+        and MCTS actually degrades play quality.
 
         Args:
-            num_games: number of games to play sequentially.
+            opponent_fn: callable ``(GameState) -> HexCoord`` for the
+                curriculum opponent.
+            use_mcts: if True, use MCTS for move selection; if False,
+                use raw policy network output (greedy argmax).
 
         Returns:
-            List of game data lists, one per game.
+            Tuple of (sample dicts list, bool indicating if NN won).
         """
+        from mcts.search import MCTS
+        from game.hex_grid import axial_to_brick, brick_to_axial
+        import random as _rng
+
+        game_state = GameState(win_length=self.win_length)
+        trajectory: List[dict] = []
+        half_move = 0
+
+        mcts_config = dict(self.config.get("mcts", {}))
+        mcts = MCTS(self.network, mcts_config) if use_mcts else None
+        prev_root = None
+
+        self.network.eval()
+
+        # Randomly assign NN to P1 or P2
+        nn_player = _rng.choice([1, 2])
+
+        while not game_state.is_terminal:
+            is_nn_turn = (game_state.current_player == nn_player)
+
+            if is_nn_turn:
+                with torch.no_grad():
+                    features, (center_q, center_r) = extract_features(
+                        game_state, grid_size=self.grid_size
+                    )
+
+                if use_mcts:
+                    # MCTS move selection
+                    num_sims = self._get_num_simulations()
+                    mcts_config["num_simulations"] = num_sims
+                    with torch.no_grad():
+                        move, policy_dict, prev_root = mcts.get_move(
+                            game_state, temperature=0.3, prev_root=prev_root
+                        )
+                    policy_grid = policy_to_grid(
+                        policy_dict, center_q, center_r, self.grid_size
+                    )
+                else:
+                    # Raw policy — greedy argmax over legal moves
+                    legal = game_state.legal_moves(zoi_margin=self.zoi_margin)
+                    valid_mask = torch.zeros(1, self.grid_size * self.grid_size)
+                    legal_map = {}
+                    for m in legal:
+                        bx, by = axial_to_brick(m.q, m.r, center_q, center_r, self.grid_size)
+                        if 0 <= bx < self.grid_size and 0 <= by < self.grid_size:
+                            idx = by * self.grid_size + bx
+                            valid_mask[0, idx] = 1.0
+                            legal_map[idx] = m
+
+                    if not legal_map:
+                        move = _rng.choice(legal)
+                        policy_grid = np.zeros(self.grid_size * self.grid_size, dtype=np.float32)
+                    else:
+                        with torch.no_grad():
+                            out = self.network(features.unsqueeze(0), valid_moves_mask=valid_mask)
+                        policy = out["policy"][0]
+                        best_idx = policy.argmax().item()
+                        move = legal_map.get(best_idx, _rng.choice(legal))
+                        policy_grid = policy.numpy()
+
+                record = {
+                    "features": features.numpy(),
+                    "policy": policy_grid,
+                    "current_player": game_state.current_player,
+                    "center": (center_q, center_r),
+                    "game_state": game_state.copy(),
+                }
+                trajectory.append(record)
+            else:
+                # Opponent move
+                move = opponent_fn(game_state)
+                prev_root = None
+
+            game_state = game_state.apply_move(move)
+            half_move += 1
+
+            if half_move >= self.max_moves:
+                logger.debug("Curriculum game hit %d move limit; draw.", self.max_moves)
+                break
+
+        # Assign value targets with TD-lambda
+        winner = game_state.winner
+        game_data: List[dict] = []
+        total_positions = len(trajectory)
+        td_gamma: float = self.config.get("training", {}).get("td_gamma", 0.99)
+
+        for t, record in enumerate(trajectory):
+            if winner is None:
+                value = 0.0
+            else:
+                raw_value = 1.0 if record["current_player"] == winner else -1.0
+                discount = td_gamma ** (total_positions - 1 - t)
+                value = discount * raw_value
+
+            sample = {
+                "features": record["features"],
+                "policy": record["policy"],
+                "value": value,
+                "center": record["center"],
+                "game_state": record["game_state"],
+            }
+            game_data.append(sample)
+
+        result_str = f"winner=P{winner}" if winner else "draw"
+        nn_won = (winner == nn_player) if winner is not None else False
+        logger.debug(
+            "Curriculum game: NN=P%d, %s, %d half-moves, %d NN positions",
+            nn_player, result_str, half_move, len(game_data),
+        )
+
+        return game_data, nn_won
+
+    def play_games(
+        self,
+        num_games: int,
+        curriculum_fns: Optional[List[Tuple[str, object]]] = None,
+        curriculum_ratio: float = 0.2,
+        curriculum_use_mcts: bool = True,
+        target_tier_idx: int = -1,
+    ) -> Tuple[List[List[dict]], dict]:
+        """Play multiple self-play games, optionally mixing in curriculum games.
+
+        Args:
+            num_games: total number of games to play.
+            curriculum_fns: list of (name, callable) opponent tiers. If provided,
+                games are split: 50% vs target tier, 50% vs lower tiers.
+            curriculum_ratio: fraction of curriculum games (default 0.2).
+            curriculum_use_mcts: whether to use MCTS in curriculum games.
+            target_tier_idx: index into curriculum_fns for the current challenge tier.
+                Only wins against this tier count toward promotion.
+
+        Returns:
+            Tuple of (game data list, stats dict with curriculum_wins/curriculum_total).
+        """
+        import random as _rng
         all_games: List[List[dict]] = []
+        curriculum_wins = 0   # wins vs target tier only
+        curriculum_total = 0  # games vs target tier only
 
         for i in range(num_games):
-            logger.info("Starting self-play game %d / %d", i + 1, num_games)
-            game_data = self.play_game()
+            use_curriculum = (
+                curriculum_fns is not None
+                and _rng.random() < curriculum_ratio
+            )
+
+            if use_curriculum:
+                # Pick opponent: 50% target tier, 50% random lower tier (for value signal)
+                if target_tier_idx > 0 and _rng.random() < 0.5:
+                    opp_idx = _rng.randint(0, target_tier_idx - 1)
+                    opp_name, opp_fn = curriculum_fns[opp_idx]
+                    is_target = False
+                else:
+                    opp_name, opp_fn = curriculum_fns[target_tier_idx]
+                    is_target = True
+
+                logger.info(
+                    "Starting curriculum game %d / %d (vs %s, mcts=%s)", i + 1, num_games, opp_name, curriculum_use_mcts
+                )
+                game_data, nn_won = self.play_curriculum_game(opp_fn, use_mcts=curriculum_use_mcts)
+                game_type = f"curriculum-{opp_name}"
+                if is_target:
+                    curriculum_total += 1
+                    if nn_won:
+                        curriculum_wins += 1
+            else:
+                logger.info("Starting self-play game %d / %d", i + 1, num_games)
+                game_data = self.play_game()
+                game_type = "self-play"
+
             all_games.append(game_data)
             logger.info(
-                "Completed self-play game %d / %d: %d positions",
-                i + 1, num_games, len(game_data),
+                "Completed %s game %d / %d: %d positions",
+                game_type, i + 1, num_games, len(game_data),
             )
 
         total_positions = sum(len(g) for g in all_games)
@@ -326,4 +503,8 @@ class SelfPlayWorker:
             num_games, total_positions,
         )
 
-        return all_games
+        stats = {
+            "curriculum_wins": curriculum_wins,
+            "curriculum_total": curriculum_total,
+        }
+        return all_games, stats

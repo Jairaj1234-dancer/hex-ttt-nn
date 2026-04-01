@@ -311,7 +311,7 @@ class MCTS:
             # Search one or two levels deep (to cover both sub-moves
             # within the same turn)
             for child in prev_root.children.values():
-                if child.game_state.board.hash == game_state.board.hash:
+                if hash(child.game_state.board) == hash(game_state.board):
                     child.parent = None  # detach from old tree (GC)
                     root, policy = self._search_from_existing(child)
                     reused = True
@@ -319,7 +319,7 @@ class MCTS:
                 # Check grandchildren (covers opponent's response)
                 if child.children:
                     for grandchild in child.children.values():
-                        if grandchild.game_state.board.hash == game_state.board.hash:
+                        if hash(grandchild.game_state.board) == hash(game_state.board):
                             grandchild.parent = None
                             root, policy = self._search_from_existing(grandchild)
                             reused = True

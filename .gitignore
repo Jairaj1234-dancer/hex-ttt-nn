@@ -40,3 +40,9 @@ wandb/
 
 # Replay buffer data
 data/replay_buffer/
+
+# Training artifacts
+*.npy
+*.log
+replay_*.json
+tournament_results.json

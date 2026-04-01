@@ -1,0 +1,61 @@
+# Win-length curriculum: start with 4-in-a-row (easy to find)
+# MCTS can discover 4-in-a-row wins → decisive games → real learning signal
+# Graduate to 5, then 6 once strong
+
+game:
+  win_length: 4                # KEY CHANGE: much easier than 6
+  first_turn_stones: 1
+  normal_turn_stones: 2
+
+network:
+  grid_size: 13
+  num_blocks: 3
+  channels: 48
+  in_channels: 12
+
+mcts:
+  num_simulations: 25
+  cpuct: 2.5
+  dirichlet_alpha: 0.15
+  dirichlet_epsilon: 0.25
+  temperature_moves: 6
+  temperature_final: 0.05
+  temperature_schedule: cosine
+  fpu_reduction: 0.0
+  zoi_margin: 2
+  virtual_loss: 3
+  num_threads: 1
+  batch_size: 8
+  max_moves: 40
+
+training:
+  num_iterations: 200
+  games_per_iteration: 30
+  training_steps_per_iteration: 80
+  batch_size: 64
+  learning_rate: 0.005
+  lr_schedule: cosine
+  lr_min: 0.0001
+  weight_decay: 0.0001
+  momentum: 0.9
+  optimizer: sgd
+  replay_buffer_size: 5000
+  augment_d6: true
+  max_grad_norm: 1.0
+  value_weight: 1.0
+  policy_weight: 1.0
+  ownership_weight: 0.05
+  threat_weight: 0.05
+  td_gamma: 0.99
+
+  # Pure self-play — games are decisive with win_length=4
+  # curriculum_agent: ladder
+  curriculum_ratio: 0.0
+
+evaluation:
+  games: 20
+  win_threshold: 0.55
+  checkpoint_interval: 10
+
+playout_cap:
+  enabled: false

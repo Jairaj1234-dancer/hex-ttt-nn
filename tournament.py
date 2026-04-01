@@ -322,7 +322,7 @@ def play_match(
     Returns:
         MatchResult with outcome details.
     """
-    game_state = GameState()
+    game_state = GameState(win_length=win_length)
     half_move = 0
     start = time.time()
 
@@ -729,7 +729,7 @@ Examples:
         config = {"network": {"grid_size": 19, "num_blocks": 8, "channels": 128, "in_channels": 12}}
 
     win_length = args.win_length
-    zoi_margin = config.get("mcts", {}).get("zoi_margin", 3)
+    zoi_margin = config.get("mcts", {}).get("zoi_margin", 2)
 
     # Build agent list
     agents: List[Agent] = []

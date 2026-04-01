@@ -279,7 +279,10 @@ class Trainer:
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
 
         self.network.load_state_dict(checkpoint["model_state_dict"])
-        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if "optimizer_state_dict" in checkpoint:
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        else:
+            logger.info("No optimizer state in checkpoint — starting with fresh optimizer")
         self.global_step = checkpoint.get("global_step", 0)
 
         if self.scheduler is not None and "scheduler_state_dict" in checkpoint:

@@ -188,7 +188,8 @@ class Evaluator:
         mcts_p1 = MCTS(player1_net, eval_mcts_config)
         mcts_p2 = MCTS(player2_net, eval_mcts_config)
 
-        game_state = GameState()
+        win_length = self.config.get("game", {}).get("win_length", 6)
+        game_state = GameState(win_length=win_length)
         half_move = 0
 
         while not game_state.is_terminal:

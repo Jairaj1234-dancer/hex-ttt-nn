@@ -1,0 +1,69 @@
+# Curriculum training: NN learns by playing against baseline agents
+# Pure curriculum (no self-play) — fixes value head miscalibration
+# Start at Greedy, promote to OnePly, then Eisenstein
+
+game:
+  win_length: 4
+  first_turn_stones: 1
+  normal_turn_stones: 2
+
+network:
+  grid_size: 13
+  num_blocks: 3
+  channels: 48
+  in_channels: 12
+
+mcts:
+  num_simulations: 50          # more sims = better policy targets
+  cpuct: 2.5
+  dirichlet_alpha: 0.15
+  dirichlet_epsilon: 0.25       # exploration noise helps discover forks
+  temperature_moves: 6
+  temperature_final: 0.05
+  temperature_schedule: cosine
+  fpu_reduction: 0.0
+  zoi_margin: 2
+  virtual_loss: 3
+  num_threads: 1
+  batch_size: 8
+  max_moves: 40
+
+training:
+  num_iterations: 300
+  games_per_iteration: 40
+  training_steps_per_iteration: 100
+  batch_size: 64
+  learning_rate: 0.003
+  lr_schedule: cosine
+  lr_min: 0.0001
+  weight_decay: 0.0001
+  momentum: 0.9
+  optimizer: sgd
+  replay_buffer_size: 8000
+  augment_d6: true
+  max_grad_norm: 1.0
+  value_weight: 1.0
+  policy_weight: 1.0
+  ownership_weight: 0.05
+  threat_weight: 0.05
+  td_gamma: 0.99
+
+  # Pure curriculum — all games against baseline opponents
+  curriculum_agent: ladder
+  curriculum_ratio: 1.0          # 100% curriculum games
+  curriculum_promote_threshold: 0.7
+  curriculum_promote_window: 40
+
+evaluation:
+  games: 20
+  win_threshold: 0.55
+  checkpoint_interval: 10
+
+playout_cap:
+  enabled: false
+
+bootstrap:
+  num_games: 10000
+  epochs: 60
+  batch_size: 128
+  learning_rate: 0.003

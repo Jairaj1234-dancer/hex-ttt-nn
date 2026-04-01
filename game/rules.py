@@ -32,6 +32,7 @@ class GameState:
         "move_history",
         "winner",
         "turn_number",
+        "win_length",
     )
 
     def __init__(
@@ -42,6 +43,7 @@ class GameState:
         move_history: List[HexCoord] | None = None,
         winner: Optional[int] = None,
         turn_number: int = 1,
+        win_length: int = 6,
     ) -> None:
         self.board: Board = board if board is not None else Board()
         self.current_player: int = current_player
@@ -49,6 +51,7 @@ class GameState:
         self.move_history: List[HexCoord] = move_history if move_history is not None else []
         self.winner: Optional[int] = winner
         self.turn_number: int = turn_number
+        self.win_length: int = win_length
 
     # ------------------------------------------------------------------
     # Convenience properties
@@ -96,7 +99,7 @@ class GameState:
         new_history = self.move_history + [coord]
 
         # Check for a win created by this stone.
-        win = new_board.check_win(coord)
+        win = new_board.check_win(coord, win_length=self.win_length)
 
         if self.moves_remaining > 1:
             # Same player still has sub-moves left this turn.
@@ -107,6 +110,7 @@ class GameState:
                 move_history=new_history,
                 winner=win,
                 turn_number=self.turn_number,
+                win_length=self.win_length,
             )
         else:
             # Turn is over -- switch player, reset budget, bump turn.
@@ -118,6 +122,7 @@ class GameState:
                 move_history=new_history,
                 winner=win,
                 turn_number=self.turn_number + 1,
+                win_length=self.win_length,
             )
 
     # ------------------------------------------------------------------
@@ -173,6 +178,7 @@ class GameState:
             move_history=list(self.move_history),
             winner=self.winner,
             turn_number=self.turn_number,
+            win_length=self.win_length,
         )
 
     def __repr__(self) -> str:

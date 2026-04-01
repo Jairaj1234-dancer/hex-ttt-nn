@@ -20,6 +20,7 @@ import yaml
 from tqdm import tqdm
 
 from nn.model import HexTTTNet
+from tournament import EisensteinGreedyAgent, GreedyAgent, OnePlyAgent, RandomAgent
 from training.evaluator import Evaluator
 from training.reanalyze import Reanalyzer
 from training.replay_buffer import ReplayBuffer
@@ -135,6 +136,48 @@ def main() -> None:
     # ---- Create self-play worker ----
     self_play_worker = SelfPlayWorker(best_network, config)
 
+    # ---- Create curriculum opponent (if configured) ----
+    curriculum_fn = None
+    curriculum_ratio = 0.0
+    curriculum_ramp_down = None
+    curriculum_ladder = []       # list of (name, fn) pairs, weakest first
+    curriculum_ladder_idx = 0    # current opponent tier
+    curriculum_promote_threshold = train_cfg.get("curriculum_promote_threshold", 0.6)
+    curriculum_promote_window = train_cfg.get("curriculum_promote_window", 30)
+    from collections import deque
+    curriculum_recent = deque(maxlen=curriculum_promote_window)  # sliding window of bools
+
+    curriculum_agent_type = train_cfg.get("curriculum_agent")
+    if curriculum_agent_type in ("eisenstein", "ladder"):
+        win_length = config.get("game", {}).get("win_length", 6)
+        zoi_margin = config.get("mcts", {}).get("zoi_margin", 3)
+
+        # Build ladder: weakest → strongest
+        curriculum_ladder = [
+            ("Random", RandomAgent(zoi_margin=zoi_margin).get_move),
+            ("Greedy", GreedyAgent(zoi_margin=zoi_margin).get_move),
+            ("OnePly", OnePlyAgent(win_length=win_length, zoi_margin=zoi_margin).get_move),
+            ("Eisenstein", EisensteinGreedyAgent(
+                win_length=win_length, zoi_margin=zoi_margin, defensive=True
+            ).get_move),
+        ]
+
+        # If agent is "eisenstein" (legacy), skip straight to Eisenstein
+        if curriculum_agent_type == "eisenstein":
+            curriculum_ladder_idx = len(curriculum_ladder) - 1
+
+        curriculum_fn = curriculum_ladder[curriculum_ladder_idx][1]
+        curriculum_ratio = train_cfg.get("curriculum_ratio", 0.2)
+        curriculum_ramp_down = train_cfg.get("curriculum_ramp_down")
+        logger.info(
+            "Curriculum ladder enabled: %s, ratio=%.0f%%, promote at %.0f%% over %d games",
+            [name for name, _ in curriculum_ladder],
+            curriculum_ratio * 100,
+            curriculum_promote_threshold * 100,
+            curriculum_promote_window,
+        )
+        logger.info("Starting at tier %d: %s", curriculum_ladder_idx, curriculum_ladder[curriculum_ladder_idx][0])
+
     # ---- Create evaluator ----
     evaluator = Evaluator(config, device=device)
 
@@ -195,12 +238,36 @@ def main() -> None:
         # ----------------------------------------------------------------
         # Step 1: Self-play -- generate games with current best network
         # ----------------------------------------------------------------
-        logger.info("Self-play: generating %d games...", games_per_iteration)
+        # Compute effective curriculum ratio (ramp down over time)
+        effective_curriculum_ratio = curriculum_ratio
+        if curriculum_ramp_down is not None and iteration >= curriculum_ramp_down:
+            # Linear ramp from full ratio to 0 over remaining iterations
+            remaining_frac = max(0.0, 1.0 - (iteration - curriculum_ramp_down) /
+                                 max(1, num_iterations - curriculum_ramp_down))
+            effective_curriculum_ratio = curriculum_ratio * remaining_frac
+
+        if curriculum_fn and effective_curriculum_ratio > 0:
+            logger.info(
+                "Self-play: generating %d games (%.0f%% curriculum)...",
+                games_per_iteration, effective_curriculum_ratio * 100,
+            )
+        else:
+            logger.info("Self-play: generating %d games...", games_per_iteration)
+
         self_play_worker.network = best_network
-        all_games = self_play_worker.play_games(games_per_iteration)
+        # Use raw policy for easy tiers, MCTS for harder ones.
+        # With win_length=4, value head gets calibrated faster from decisive games.
+        curriculum_use_mcts = (curriculum_ladder_idx >= 2) if curriculum_ladder else True
+        all_games, sp_stats = self_play_worker.play_games(
+            games_per_iteration,
+            curriculum_fns=curriculum_ladder if curriculum_ladder and effective_curriculum_ratio > 0 else None,
+            curriculum_ratio=effective_curriculum_ratio,
+            curriculum_use_mcts=curriculum_use_mcts,
+            target_tier_idx=curriculum_ladder_idx,
+        )
 
         # ----------------------------------------------------------------
-        # Step 2: Add game data to replay buffer
+        # Step 2: Add game data to replay buffer + track curriculum progress
         # ----------------------------------------------------------------
         total_positions = 0
         for game_data in all_games:
@@ -211,6 +278,39 @@ def main() -> None:
             "Added %d positions from %d games. Buffer size: %d",
             total_positions, len(all_games), len(replay_buffer),
         )
+
+        # Track curriculum ladder progress (sliding window)
+        if curriculum_ladder and sp_stats["curriculum_total"] > 0:
+            # Add individual game results to sliding window
+            cw, ct = sp_stats["curriculum_wins"], sp_stats["curriculum_total"]
+            for _ in range(cw):
+                curriculum_recent.append(True)
+            for _ in range(ct - cw):
+                curriculum_recent.append(False)
+
+            tier_name = curriculum_ladder[curriculum_ladder_idx][0]
+            window_wins = sum(curriculum_recent)
+            window_total = len(curriculum_recent)
+            tier_wr = window_wins / max(window_total, 1)
+            logger.info(
+                "Curriculum vs %s: %d/%d wins in last %d games (%.0f%%)",
+                tier_name, window_wins, window_total, window_total, tier_wr * 100,
+            )
+
+            # Promote to next tier if sliding window win rate exceeds threshold
+            if (
+                window_total >= curriculum_promote_window
+                and tier_wr >= curriculum_promote_threshold
+                and curriculum_ladder_idx < len(curriculum_ladder) - 1
+            ):
+                curriculum_ladder_idx += 1
+                curriculum_fn = curriculum_ladder[curriculum_ladder_idx][1]
+                new_tier_name = curriculum_ladder[curriculum_ladder_idx][0]
+                logger.info(
+                    "*** PROMOTED to tier %d: %s (was %.0f%% vs %s) ***",
+                    curriculum_ladder_idx, new_tier_name, tier_wr * 100, tier_name,
+                )
+                curriculum_recent.clear()
 
         # ----------------------------------------------------------------
         # Step 3: Training -- run gradient steps on replay buffer
@@ -275,26 +375,40 @@ def main() -> None:
         should_evaluate = (iteration + 1) % checkpoint_interval == 0 or iteration == num_iterations - 1
 
         if should_evaluate:
-            logger.info("Evaluating candidate network vs current best (%d games)...", eval_games)
-            win_rate, accepted = evaluator.evaluate(
-                candidate=network,
-                current_best=best_network,
-                num_games=eval_games,
-            )
+            # With high curriculum ratio, self-play gating is unreliable
+            # (first-player advantage causes 50/50 splits). Skip gating
+            # and always update when curriculum_ratio >= 0.8.
+            skip_gating = (effective_curriculum_ratio >= 0.8)
 
-            if accepted:
+            if skip_gating:
                 best_network.load_state_dict(network.state_dict())
-                elo_delta = 400.0 * (win_rate - 0.5)  # Approximate Elo gain
-                elo_estimate += elo_delta
                 logger.info(
-                    "Candidate ACCEPTED (win rate=%.3f). New best network. Elo ~%.0f (+%.0f)",
-                    win_rate, elo_estimate, elo_delta,
+                    "Gating skipped (curriculum_ratio=%.0f%%). Best network updated.",
+                    effective_curriculum_ratio * 100,
                 )
+                win_rate = 0.5
+                accepted = True
             else:
-                logger.info(
-                    "Candidate REJECTED (win rate=%.3f). Keeping current best.",
-                    win_rate,
+                logger.info("Evaluating candidate network vs current best (%d games)...", eval_games)
+                win_rate, accepted = evaluator.evaluate(
+                    candidate=network,
+                    current_best=best_network,
+                    num_games=eval_games,
                 )
+
+                if accepted:
+                    best_network.load_state_dict(network.state_dict())
+                    elo_delta = 400.0 * (win_rate - 0.5)  # Approximate Elo gain
+                    elo_estimate += elo_delta
+                    logger.info(
+                        "Candidate ACCEPTED (win rate=%.3f). New best network. Elo ~%.0f (+%.0f)",
+                        win_rate, elo_estimate, elo_delta,
+                    )
+                else:
+                    logger.info(
+                        "Candidate REJECTED (win rate=%.3f). Keeping current best.",
+                        win_rate,
+                    )
 
             elo_entry = {
                 "iteration": iteration + 1,
