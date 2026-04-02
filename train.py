@@ -133,6 +133,27 @@ def main() -> None:
     augment = train_cfg.get("augment_d6", True)
     replay_buffer = ReplayBuffer(capacity=position_capacity, augment=augment)
 
+    # ---- Pre-fill replay buffer with bootstrap data (if available) ----
+    bootstrap_dataset_path = train_cfg.get("bootstrap_prefill")
+    if bootstrap_dataset_path is None:
+        # Auto-detect: look for the matching bootstrap dataset
+        import os
+        for candidate in ["bootstrap_dataset_w4_10k.npy", "bootstrap_dataset.npy"]:
+            if os.path.exists(candidate):
+                bootstrap_dataset_path = candidate
+                break
+
+    if bootstrap_dataset_path and os.path.exists(bootstrap_dataset_path):
+        import numpy as _np
+        logger.info("Pre-filling replay buffer from %s...", bootstrap_dataset_path)
+        bs_data = list(_np.load(bootstrap_dataset_path, allow_pickle=True))
+        # Add in chunks as "games" for the buffer's game tracking
+        chunk_size = 20
+        for i in range(0, len(bs_data), chunk_size):
+            chunk = bs_data[i:i + chunk_size]
+            replay_buffer.add_game(chunk)
+        logger.info("Pre-filled buffer with %d bootstrap positions", len(bs_data))
+
     # ---- Create self-play worker ----
     self_play_worker = SelfPlayWorker(best_network, config)
 
@@ -255,9 +276,11 @@ def main() -> None:
             logger.info("Self-play: generating %d games...", games_per_iteration)
 
         self_play_worker.network = best_network
-        # Use raw policy for easy tiers, MCTS for harder ones.
-        # With win_length=4, value head gets calibrated faster from decisive games.
-        curriculum_use_mcts = (curriculum_ladder_idx >= 2) if curriculum_ladder else True
+        # Always use raw policy for curriculum games until value head is calibrated.
+        # MCTS with uncalibrated value head actually degrades play quality.
+        # Switch to MCTS only after beating the current tier at >30% with raw policy,
+        # indicating the value head has learned something useful.
+        curriculum_use_mcts = False
         all_games, sp_stats = self_play_worker.play_games(
             games_per_iteration,
             curriculum_fns=curriculum_ladder if curriculum_ladder and effective_curriculum_ratio > 0 else None,

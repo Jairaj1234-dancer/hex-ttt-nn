@@ -360,7 +360,7 @@ class SelfPlayWorker:
                         policy_dict, center_q, center_r, self.grid_size
                     )
                 else:
-                    # Raw policy — greedy argmax over legal moves
+                    # Raw policy with temperature sampling for exploration
                     legal = game_state.legal_moves(zoi_margin=self.zoi_margin)
                     valid_mask = torch.zeros(1, self.grid_size * self.grid_size)
                     legal_map = {}
@@ -378,9 +378,21 @@ class SelfPlayWorker:
                         with torch.no_grad():
                             out = self.network(features.unsqueeze(0), valid_moves_mask=valid_mask)
                         policy = out["policy"][0]
-                        best_idx = policy.argmax().item()
-                        move = legal_map.get(best_idx, _rng.choice(legal))
                         policy_grid = policy.numpy()
+
+                        # Temperature sampling with low temp for short games
+                        temp = 0.3  # mild exploration, not the full cosine schedule
+                        legal_indices = list(legal_map.keys())
+                        if temp < 0.1:
+                            # Greedy
+                            chosen_idx = max(legal_indices, key=lambda i: policy_grid[i])
+                        else:
+                            # Sample from sharpened distribution
+                            probs = np.array([policy_grid[i] for i in legal_indices])
+                            probs = probs ** (1.0 / temp)
+                            probs /= probs.sum() + 1e-8
+                            chosen_idx = legal_indices[np.random.choice(len(legal_indices), p=probs)]
+                        move = legal_map[chosen_idx]
 
                 record = {
                     "features": features.numpy(),
@@ -391,9 +403,31 @@ class SelfPlayWorker:
                 }
                 trajectory.append(record)
             else:
-                # Opponent move
+                # Opponent move — also record as training data (teacher signal)
                 move = opponent_fn(game_state)
                 prev_root = None
+
+                # Extract features from opponent's perspective and create
+                # a one-hot policy target for the opponent's chosen move.
+                # This teaches the NN the opponent's blocking/winning patterns.
+                with torch.no_grad():
+                    opp_features, (opp_cq, opp_cr) = extract_features(
+                        game_state, grid_size=self.grid_size
+                    )
+                opp_bx, opp_by = axial_to_brick(
+                    move.q, move.r, opp_cq, opp_cr, self.grid_size
+                )
+                if 0 <= opp_bx < self.grid_size and 0 <= opp_by < self.grid_size:
+                    opp_policy = np.zeros(self.grid_size * self.grid_size, dtype=np.float32)
+                    opp_idx = opp_by * self.grid_size + opp_bx
+                    opp_policy[opp_idx] = 1.0
+                    trajectory.append({
+                        "features": opp_features.numpy(),
+                        "policy": opp_policy,
+                        "current_player": game_state.current_player,
+                        "center": (opp_cq, opp_cr),
+                        "game_state": game_state.copy(),
+                    })
 
             game_state = game_state.apply_move(move)
             half_move += 1
