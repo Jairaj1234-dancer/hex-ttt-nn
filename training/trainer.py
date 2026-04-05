@@ -75,27 +75,35 @@ class Trainer:
         )
 
     def _create_optimizer(self) -> optim.Optimizer:
-        """Create SGD optimizer with momentum and weight decay (L2 regularisation).
+        """Create optimizer based on config (SGD or Adam).
 
         Returns:
-            Configured ``torch.optim.SGD`` optimizer.
+            Configured optimizer.
         """
         lr = self.train_config.get("learning_rate", 0.02)
-        momentum = self.train_config.get("momentum", 0.9)
         weight_decay = self.train_config.get("weight_decay", 1e-4)
+        opt_type = self.train_config.get("optimizer", "sgd").lower()
 
-        optimizer = optim.SGD(
-            self.network.parameters(),
-            lr=lr,
-            momentum=momentum,
-            weight_decay=weight_decay,
-            nesterov=True,
-        )
-
-        logger.debug(
-            "Created SGD optimizer: lr=%.6f, momentum=%.2f, weight_decay=%.6f, nesterov=True",
-            lr, momentum, weight_decay,
-        )
+        if opt_type == "adam":
+            optimizer = optim.Adam(
+                self.network.parameters(),
+                lr=lr,
+                weight_decay=weight_decay,
+            )
+            logger.debug("Created Adam optimizer: lr=%.6f, weight_decay=%.6f", lr, weight_decay)
+        else:
+            momentum = self.train_config.get("momentum", 0.9)
+            optimizer = optim.SGD(
+                self.network.parameters(),
+                lr=lr,
+                momentum=momentum,
+                weight_decay=weight_decay,
+                nesterov=True,
+            )
+            logger.debug(
+                "Created SGD optimizer: lr=%.6f, momentum=%.2f, weight_decay=%.6f, nesterov=True",
+                lr, momentum, weight_decay,
+            )
         return optimizer
 
     def _create_scheduler(self) -> Optional[optim.lr_scheduler.LRScheduler]:

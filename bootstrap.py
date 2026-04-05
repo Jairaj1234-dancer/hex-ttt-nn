@@ -30,7 +30,7 @@ from game.hex_grid import HexCoord
 from game.rules import GameState
 from nn.features import extract_features
 from nn.model import HexTTTNet
-from tournament import EisensteinGreedyAgent, OnePlyAgent
+from tournament import EisensteinGreedyAgent, OnePlyAgent, GreedyAgent
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,6 +59,7 @@ def generate_games(
     agents = [
         ("Eisenstein", EisensteinGreedyAgent(win_length=win_length, zoi_margin=zoi_margin, defensive=True)),
         ("OnePly", OnePlyAgent(win_length=win_length, zoi_margin=zoi_margin)),
+        ("Greedy", GreedyAgent(zoi_margin=zoi_margin)),
     ]
 
     all_samples = []
@@ -277,6 +278,8 @@ def main():
     parser.add_argument("--config", default="configs/bootstrap.yaml")
     parser.add_argument("--device", default="cpu", help="cpu, mps, or cuda")
     parser.add_argument("--skip-generate", action="store_true", help="Load existing dataset")
+    parser.add_argument("--skip-eval", action="store_true", help="Skip post-training evaluation")
+    parser.add_argument("--dataset", default=None, help="Dataset filename (default: auto from config)")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -290,12 +293,12 @@ def main():
     logger.info("Bootstrap training on %s (grid=%d)", device, grid_size)
 
     # Step 1: Generate dataset
-    dataset_path = "bootstrap_dataset.npy"
+    num_games = bootstrap_cfg.get("num_games", 2000)
+    dataset_path = args.dataset or f"bootstrap_dataset_w{config['game']['win_length']}_{num_games // 1000}k.npy"
     if args.skip_generate and os.path.exists(dataset_path):
         logger.info("Loading existing dataset from %s", dataset_path)
         dataset = list(np.load(dataset_path, allow_pickle=True))
     else:
-        num_games = bootstrap_cfg.get("num_games", 2000)
         max_moves = config.get("mcts", {}).get("max_moves", 40)
         zoi_margin = config.get("mcts", {}).get("zoi_margin", 2)
         dataset = generate_games(
@@ -325,7 +328,7 @@ def main():
 
     # Step 3: Save checkpoint
     os.makedirs("checkpoints", exist_ok=True)
-    ckpt_path = "checkpoints/bootstrap.pt"
+    ckpt_path = f"checkpoints/bootstrap_scaled_w{config['game']['win_length']}_{num_games // 1000}k.pt"
     torch.save({
         "model_state_dict": model.state_dict(),
         "config": config,
@@ -334,9 +337,12 @@ def main():
     }, ckpt_path)
     logger.info("Checkpoint saved to %s", ckpt_path)
 
-    # Step 4: Evaluate
-    logger.info("Evaluating bootstrapped model...")
-    evaluate_vs_baselines(model, config, device, num_games=10)
+    # Step 4: Evaluate (optional — MCTS eval can be slow)
+    if not args.skip_eval:
+        logger.info("Evaluating bootstrapped model...")
+        evaluate_vs_baselines(model, config, device, num_games=10)
+    else:
+        logger.info("Skipping evaluation (--skip-eval)")
 
     logger.info("Done! Resume with: python train.py --config configs/bootstrap.yaml --checkpoint %s", ckpt_path)
 

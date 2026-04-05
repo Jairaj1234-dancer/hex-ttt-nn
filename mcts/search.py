@@ -59,6 +59,47 @@ class MCTS:
         self.config = config
         self.device = config.get("device", "cpu")
 
+    def check_forced_move(self, game_state: GameState) -> Optional[Tuple[HexCoord, float]]:
+        """Check for an immediate win or a must-block move (1-ply solver).
+
+        Scans legal moves for:
+          1. A move that wins immediately for the current player -> (move, +1.0)
+          2. A move that blocks the opponent's immediate win  -> (move, value)
+             If multiple blocks needed, position is likely lost -> (any_block, -0.8)
+
+        Returns None if no forced move exists.
+        """
+        zoi_margin: int = self.config.get("zoi_margin", 3)
+        legal = game_state.legal_moves(zoi_margin=zoi_margin)
+        if not legal:
+            return None
+
+        player = game_state.current_player
+        opponent = 3 - player
+        board = game_state.board
+        win_length = game_state.win_length
+
+        # Check for immediate win
+        for move in legal:
+            new_board = board.place(move, player)
+            if new_board.check_win(move, win_length) == player:
+                return (move, 1.0)
+
+        # Check for must-block (opponent would win if they played here)
+        blocks = []
+        for move in legal:
+            new_board = board.place(move, opponent)
+            if new_board.check_win(move, win_length) == opponent:
+                blocks.append(move)
+
+        if len(blocks) == 1:
+            return (blocks[0], 0.0)  # forced block, neutral value
+        elif len(blocks) >= 2:
+            # Multiple threats — likely lost, but still block one
+            return (blocks[0], -0.8)
+
+        return None
+
     def search(self, game_state: GameState) -> Tuple[MCTSNode, Dict[HexCoord, float]]:
         """Run MCTS from the given game state.
 
@@ -71,6 +112,23 @@ class MCTS:
         fpu_reduction: float = self.config.get("fpu_reduction", 0.0)
         dirichlet_alpha: float = self.config.get("dirichlet_alpha", 0.10)
         dirichlet_epsilon: float = self.config.get("dirichlet_epsilon", 0.25)
+
+        # 0. Check for forced moves (1-ply solver) — skips MCTS entirely.
+        if not game_state.is_terminal:
+            forced = self.check_forced_move(game_state)
+            if forced is not None:
+                move, value = forced
+                root = MCTSNode(game_state=game_state)
+                root.visit_count = num_simulations
+                root.total_value = value * num_simulations
+                # Create a single child with all visits
+                child_state = game_state.apply_move(move)
+                child = MCTSNode(game_state=child_state, parent=root, prior=1.0)
+                child.visit_count = num_simulations
+                child.total_value = -value * num_simulations
+                root.children[move] = child
+                root.is_expanded = True
+                return root, {move: 1.0}
 
         # 1. Create root node.
         root = MCTSNode(game_state=game_state)
@@ -155,6 +213,13 @@ class MCTS:
             game_state, center_q, center_r, grid_size, margin=zoi_margin
         )
 
+        # TRANSPOSE the ZoI mask to match the model's column-major training.
+        # Training code (beat_eisenstein.py) used bx,by = axial_to_brick(...)
+        # then idx = (by+half)*W + (bx+half), which is column-major because
+        # axial_to_brick returns (row, col) but training swapped them.
+        # The mask is built in correct row-major, so we transpose it to align.
+        zoi_mask_2d = zoi_mask_2d.T.copy()
+
         # Prepare tensors for network (add batch dimension).
         features_batch = features.unsqueeze(0).to(self.device)  # (1, C, H, W)
         mask_flat = torch.from_numpy(zoi_mask_2d.reshape(1, -1)).to(self.device)  # (1, H*W)
@@ -177,11 +242,15 @@ class MCTS:
             if zoi_mask_flat[idx] > 0.0:
                 prob = float(policy_probs[idx])
                 if prob > 0.0:
-                    row_idx = idx // grid_size
-                    col_idx = idx % grid_size
-                    # Convert grid position back to axial coordinates.
+                    # Model was trained with column-major indexing:
+                    #   idx = (col+half)*W + (row+half)
+                    # So idx//W gives col+half and idx%W gives row+half.
+                    col_plus_half = idx // grid_size
+                    row_plus_half = idx % grid_size
+                    # brick_to_axial expects (row, col).
                     coord = brick_to_axial(
-                        row_idx - half, col_idx - half, center_q, center_r, grid_size
+                        row_plus_half - half, col_plus_half - half,
+                        center_q, center_r, grid_size
                     )
                     move_priors[coord] = prob
 
@@ -193,6 +262,13 @@ class MCTS:
                 uniform_p = 1.0 / len(zoi_cells)
                 for coord in zoi_cells:
                     move_priors[coord] = uniform_p
+
+        # 5b. Limit branches to top-K moves by policy probability.
+        # This keeps the search focused and efficient on infinite boards.
+        max_branches: int = self.config.get("max_branches", 0)
+        if max_branches > 0 and len(move_priors) > max_branches:
+            sorted_moves = sorted(move_priors.items(), key=lambda kv: -kv[1])
+            move_priors = dict(sorted_moves[:max_branches])
 
         # Re-normalise priors to sum to 1 (they should already be close due
         # to softmax, but masking and float rounding can introduce drift).
@@ -304,6 +380,16 @@ class MCTS:
         """
         if temperature is None:
             temperature = self.config.get("temperature", 0.0)
+
+        # Fast path: check for forced win/block before any search
+        if not game_state.is_terminal:
+            forced = self.check_forced_move(game_state)
+            if forced is not None:
+                move, value = forced
+                root = MCTSNode(game_state=game_state)
+                root.visit_count = 1
+                root.total_value = value
+                return move, {move: 1.0}, root
 
         # Tree reuse: try to find the current state in the previous tree
         reused = False

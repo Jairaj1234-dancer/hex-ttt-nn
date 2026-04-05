@@ -66,10 +66,15 @@ class HexTTTNet(nn.Module):
         # ---- Shared backbone ----
         self.backbone = HexResNet(in_channels, num_blocks, channels)
 
-        # ---- Policy head ----
-        self.policy_conv = nn.Conv2d(channels, 2, kernel_size=1, bias=False)
-        self.policy_bn = nn.BatchNorm2d(2)
-        self.policy_fc = nn.Linear(2 * hw, hw)
+        # ---- Policy head (fully convolutional) ----
+        # Conv(ch→ch, 1x1) → BN → ReLU → Conv(ch→1, 1x1)
+        # Spatially aware — no FC bottleneck.
+        self.policy_head = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=1),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, 1, kernel_size=1),
+        )
 
         # ---- Value head ----
         self.value_conv = nn.Conv2d(channels, 1, kernel_size=1, bias=False)
@@ -113,10 +118,9 @@ class HexTTTNet(nn.Module):
         # ---- Backbone ----
         trunk = self.backbone(x)  # (B, C, H, W)
 
-        # ---- Policy head ----
-        p = F.relu(self.policy_bn(self.policy_conv(trunk)))  # (B, 2, H, W)
-        p = p.reshape(B, -1)  # (B, 2*H*W)
-        policy_logits = self.policy_fc(p)  # (B, H*W)
+        # ---- Policy head (fully convolutional) ----
+        p = self.policy_head(trunk)  # (B, 1, H, W)
+        policy_logits = p.reshape(B, -1)  # (B, H*W)
 
         if valid_moves_mask is not None:
             # Set logits for illegal moves to -inf so they get zero probability.

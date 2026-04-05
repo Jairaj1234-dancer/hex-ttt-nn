@@ -135,10 +135,17 @@ def main() -> None:
 
     # ---- Pre-fill replay buffer with bootstrap data (if available) ----
     bootstrap_dataset_path = train_cfg.get("bootstrap_prefill")
-    if bootstrap_dataset_path is None:
+    if bootstrap_dataset_path == "none":
+        bootstrap_dataset_path = None  # Explicitly disabled
+    elif bootstrap_dataset_path is None:
         # Auto-detect: look for the matching bootstrap dataset
         import os
-        for candidate in ["bootstrap_dataset_w4_10k.npy", "bootstrap_dataset.npy"]:
+        win_length = config.get("game", {}).get("win_length", 4)
+        if win_length >= 6:
+            candidates = ["bootstrap_dataset_w6_80k_sub.npy", "bootstrap_dataset_w6_20k.npy"]
+        else:
+            candidates = ["bootstrap_dataset_w4_50k.npy", "bootstrap_dataset_w4_10k.npy", "bootstrap_dataset.npy"]
+        for candidate in candidates:
             if os.path.exists(candidate):
                 bootstrap_dataset_path = candidate
                 break
@@ -276,11 +283,30 @@ def main() -> None:
             logger.info("Self-play: generating %d games...", games_per_iteration)
 
         self_play_worker.network = best_network
-        # Always use raw policy for curriculum games until value head is calibrated.
-        # MCTS with uncalibrated value head actually degrades play quality.
-        # Switch to MCTS only after beating the current tier at >30% with raw policy,
-        # indicating the value head has learned something useful.
-        curriculum_use_mcts = False
+        # Progressive MCTS: start with raw policy, enable MCTS once the model
+        # shows calibration (win_rate > threshold vs current curriculum tier).
+        progressive_cfg = train_cfg.get("progressive_mcts", False)
+        progressive_threshold = train_cfg.get("progressive_mcts_threshold", 0.30)
+        progressive_iter_min = train_cfg.get("progressive_mcts_iter_min", 20)
+        progressive_sims_initial = train_cfg.get("progressive_mcts_sims_initial", 25)
+        progressive_sims_full = train_cfg.get("progressive_mcts_sims_full", 50)
+
+        if progressive_cfg and iteration >= progressive_iter_min:
+            # Check if model has calibrated value head
+            window_total = len(curriculum_recent)
+            window_wr = sum(curriculum_recent) / max(window_total, 1) if window_total > 0 else 0.0
+            if window_wr >= progressive_threshold:
+                curriculum_use_mcts = True
+                # Ramp up sims: start low, increase over iterations
+                ramp = min(1.0, (iteration - progressive_iter_min) / 30.0)
+                mcts_sims = int(progressive_sims_initial + ramp * (progressive_sims_full - progressive_sims_initial))
+                config["mcts"]["num_simulations"] = mcts_sims
+                logger.info("Progressive MCTS ON: %d sims (win_rate=%.0f%%)", mcts_sims, window_wr * 100)
+            else:
+                curriculum_use_mcts = False
+                logger.info("Progressive MCTS OFF: win_rate=%.0f%% < threshold %.0f%%", window_wr * 100, progressive_threshold * 100)
+        else:
+            curriculum_use_mcts = False
         all_games, sp_stats = self_play_worker.play_games(
             games_per_iteration,
             curriculum_fns=curriculum_ladder if curriculum_ladder and effective_curriculum_ratio > 0 else None,

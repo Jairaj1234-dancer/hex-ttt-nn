@@ -1,0 +1,82 @@
+# Scaled model config for the REAL game: 6-in-a-row
+# 6 blocks, 96 channels (~1.1M params)
+# Fully-convolutional policy head, curriculum training
+
+game:
+  win_length: 6
+  first_turn_stones: 1
+  normal_turn_stones: 2
+
+network:
+  grid_size: 13
+  num_blocks: 6
+  channels: 96
+  in_channels: 12
+
+mcts:
+  num_simulations: 50
+  cpuct: 2.5
+  dirichlet_alpha: 0.15
+  dirichlet_epsilon: 0.25
+  temperature_moves: 8
+  temperature_final: 0.05
+  temperature_schedule: cosine
+  fpu_reduction: 0.0
+  zoi_margin: 3          # larger margin for 6-in-a-row (need to see further)
+  virtual_loss: 3
+  num_threads: 1
+  batch_size: 8
+  max_moves: 60          # longer games with 6-in-a-row
+
+training:
+  num_iterations: 300
+  games_per_iteration: 80
+  training_steps_per_iteration: 100
+  batch_size: 128
+  learning_rate: 0.0005
+  bootstrap_prefill: none
+  lr_schedule: cosine
+  lr_min: 0.00005
+  weight_decay: 0.0001
+  momentum: 0.9
+  optimizer: adam
+  replay_buffer_size: 5000
+  augment_d6: true
+  max_grad_norm: 1.0
+  value_weight: 1.0
+  policy_weight: 1.0
+  ownership_weight: 0.05
+  threat_weight: 0.05
+  td_gamma: 0.99
+
+  # Curriculum config
+  curriculum_agent: ladder
+  curriculum_ratio: 1.0
+  curriculum_promote_threshold: 0.65
+  curriculum_promote_window: 40
+
+  # Progressive MCTS
+  progressive_mcts: true
+  progressive_mcts_threshold: 0.30
+  progressive_mcts_sims_initial: 25
+  progressive_mcts_sims_full: 50
+  progressive_mcts_iter_min: 20
+
+  # Temperature for curriculum games
+  curriculum_temperature: 0.5
+  curriculum_temperature_final: 0.05
+  curriculum_temperature_moves: 8
+
+evaluation:
+  games: 20
+  win_threshold: 0.55
+  checkpoint_interval: 10
+
+playout_cap:
+  enabled: false
+
+bootstrap:
+  num_games: 50000
+  epochs: 100
+  batch_size: 256
+  learning_rate: 0.003

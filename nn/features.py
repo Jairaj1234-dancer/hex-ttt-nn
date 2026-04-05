@@ -44,6 +44,33 @@ from game.hex_grid import HexCoord, HEX_AXES, hex_distance, axial_to_brick
 
 NUM_INPUT_PLANES: int = 12
 
+# Cache for coordinate/distance planes (keyed by grid_size)
+_coord_plane_cache: Dict[int, np.ndarray] = {}
+
+
+def _get_coord_planes(grid_size: int) -> np.ndarray:
+    """Return cached (3, grid_size, grid_size) array for Q_REL, R_REL, DIST planes."""
+    if grid_size in _coord_plane_cache:
+        return _coord_plane_cache[grid_size]
+
+    half = grid_size // 2
+    planes = np.zeros((3, grid_size, grid_size), dtype=np.float32)
+    max_dist = float(half) if half > 0 else 1.0
+
+    for row in range(grid_size):
+        for col in range(grid_size):
+            r_rel = row - half
+            q_rel = (col - half) - r_rel // 2
+            planes[0, row, col] = q_rel / half if half > 0 else 0.0  # Q_RELATIVE
+            planes[1, row, col] = r_rel / half if half > 0 else 0.0  # R_RELATIVE
+            # DISTANCE_TO_CENTROID (approx — uses grid center, not dynamic centroid)
+            dist = abs(q_rel) + abs(r_rel) + abs(-q_rel - r_rel)
+            planes[2, row, col] = min((dist / 2) / max_dist, 1.0)
+
+    _coord_plane_cache[grid_size] = planes
+    return planes
+
+
 # ---------------------------------------------------------------------------
 # Threat detection
 # ---------------------------------------------------------------------------
@@ -59,18 +86,8 @@ def compute_threats(
 ) -> np.ndarray:
     """Find empty cells that would complete a line of *threat_length* for *player*.
 
-    For every empty cell inside the window, check along each of the 3 hex
-    axes whether placing a stone there would create a consecutive run of
-    at least ``threat_length`` friendly stones (including the hypothetical
-    stone itself).
-
-    Args:
-        board_stones: mapping of ``HexCoord -> player_id`` (the board's stones).
-        player: the player to compute threats for (1 or 2).
-        center_q: axial q of the window centre.
-        center_r: axial r of the window centre.
-        grid_size: spatial dimension of the output array.
-        threat_length: required consecutive count (e.g. 5 for open-5 threat).
+    Optimized: only checks empty cells adjacent to the player's stones
+    (within threat_length-1 steps along each axis), avoiding full grid scan.
 
     Returns:
         ``(grid_size, grid_size)`` binary float32 array.
@@ -78,36 +95,56 @@ def compute_threats(
     half = grid_size // 2
     result = np.zeros((grid_size, grid_size), dtype=np.float32)
 
-    for row in range(grid_size):
-        for col in range(grid_size):
-            # Brick-wall -> axial (inverse of axial_to_brick with the given centre).
-            r_ax = row - half + center_r
-            q_ax = (col - half) - (row - half) // 2 + center_q
-            coord = HexCoord(q_ax, r_ax)
+    # Collect candidate empty cells: neighbors of player's stones along axes
+    # This is much smaller than grid_size^2 for sparse boards
+    candidates = set()
+    for coord, pid in board_stones.items():
+        if pid != player:
+            continue
+        for axis in HEX_AXES:
+            for direction in (1, -1):
+                c = HexCoord(
+                    coord.q + direction * axis.q,
+                    coord.r + direction * axis.r,
+                )
+                # Walk up to threat_length-1 steps to find empty cells
+                for _ in range(threat_length - 1):
+                    if c not in board_stones:
+                        candidates.add(c)
+                        break
+                    if board_stones[c] != player:
+                        break
+                    c = HexCoord(
+                        c.q + direction * axis.q,
+                        c.r + direction * axis.r,
+                    )
 
-            # Only consider empty cells.
-            if coord in board_stones:
-                continue
+    # Check each candidate
+    for coord in candidates:
+        # Map to grid position
+        r_rel = coord.r - center_r
+        q_rel = coord.q - center_q
+        row = r_rel + half
+        col = q_rel + r_rel // 2 + half
+        if not (0 <= row < grid_size and 0 <= col < grid_size):
+            continue
 
-            # Check each of the 3 axes.
-            for axis in HEX_AXES:
-                count = 1  # the hypothetical stone itself
+        for axis in HEX_AXES:
+            count = 1
 
-                # Walk in the positive direction.
-                c = HexCoord(coord.q + axis.q, coord.r + axis.r)
-                while board_stones.get(c) == player:
-                    count += 1
-                    c = HexCoord(c.q + axis.q, c.r + axis.r)
+            c = HexCoord(coord.q + axis.q, coord.r + axis.r)
+            while board_stones.get(c) == player:
+                count += 1
+                c = HexCoord(c.q + axis.q, c.r + axis.r)
 
-                # Walk in the negative direction.
-                c = HexCoord(coord.q - axis.q, coord.r - axis.r)
-                while board_stones.get(c) == player:
-                    count += 1
-                    c = HexCoord(c.q - axis.q, c.r - axis.r)
+            c = HexCoord(coord.q - axis.q, coord.r - axis.r)
+            while board_stones.get(c) == player:
+                count += 1
+                c = HexCoord(c.q - axis.q, c.r - axis.r)
 
-                if count >= threat_length:
-                    result[row, col] = 1.0
-                    break  # no need to check other axes for this cell
+            if count >= threat_length:
+                result[row, col] = 1.0
+                break
 
     return result
 
@@ -208,39 +245,19 @@ def extract_features(
                     planes[5, row_idx, col_idx] = weight
 
     # ------------------------------------------------------------------
-    # Planes 6-7: Q_RELATIVE, R_RELATIVE (normalised coordinates)
+    # Planes 6-8: Q_RELATIVE, R_RELATIVE, DISTANCE_TO_CENTROID (cached)
     # ------------------------------------------------------------------
-    for row in range(grid_size):
-        for col in range(grid_size):
-            # Brick-wall -> relative axial coords
-            # axial_to_brick: row = r - center_r, col = (q - center_q) + (r - center_r) // 2
-            # We've offset by +half, so row_offset = row - half, col_offset = col - half
-            r_rel = row - half  # = r - center_r
-            q_rel = (col - half) - r_rel // 2  # = q - center_q
-            planes[6, row, col] = q_rel / half if half > 0 else 0.0
-            planes[7, row, col] = r_rel / half if half > 0 else 0.0
+    coord_planes = _get_coord_planes(grid_size)
+    planes[6] = coord_planes[0]  # Q_RELATIVE
+    planes[7] = coord_planes[1]  # R_RELATIVE
+    planes[8] = coord_planes[2]  # DISTANCE_TO_CENTROID
 
     # ------------------------------------------------------------------
-    # Plane 8: DISTANCE_TO_CENTROID
+    # Planes 9-11: Threat planes (adapt to game's win_length)
     # ------------------------------------------------------------------
-    # Centroid in fractional axial coords; we compute hex distance from
-    # each cell to the centroid (using rounded centroid as reference since
-    # hex_distance works on integers -- the centroid IS the window centre).
-    centroid_coord = HexCoord(center_q, center_r)
-    max_dist = float(half) if half > 0 else 1.0
-    for row in range(grid_size):
-        for col in range(grid_size):
-            r_rel = row - half
-            q_rel = (col - half) - r_rel // 2
-            cell_coord = HexCoord(center_q + q_rel, center_r + r_rel)
-            dist = hex_distance(cell_coord, centroid_coord)
-            planes[8, row, col] = min(dist / max_dist, 1.0)
-
-    # ------------------------------------------------------------------
-    # Planes 9-11: Threat planes
-    # ------------------------------------------------------------------
-    planes[9] = compute_threats(stones, current_player, center_q, center_r, grid_size, threat_length=5)
-    planes[10] = compute_threats(stones, opponent, center_q, center_r, grid_size, threat_length=5)
-    planes[11] = compute_threats(stones, current_player, center_q, center_r, grid_size, threat_length=4)
+    wl = getattr(game_state, 'win_length', 6)
+    planes[9] = compute_threats(stones, current_player, center_q, center_r, grid_size, threat_length=wl)
+    planes[10] = compute_threats(stones, opponent, center_q, center_r, grid_size, threat_length=wl)
+    planes[11] = compute_threats(stones, current_player, center_q, center_r, grid_size, threat_length=wl - 1)
 
     return torch.from_numpy(planes), (center_q, center_r)
