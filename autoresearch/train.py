@@ -287,7 +287,11 @@ def main():
     model.eval()
     metric = evaluate_model(model, DEVICE, num_games=40)
 
-    # Save if improved
+    # Always save last experiment model (run.py copies to per-experiment checkpoint)
+    last_ckpt = AUTORESEARCH_DIR / "last_experiment.pt"
+    torch.save({"model_state_dict": model.state_dict(), "metric": metric}, str(last_ckpt))
+
+    # Save as best if improved
     best = get_best_metric()
     if metric > best:
         save_best_model(model, metric, experiment_id=-1)

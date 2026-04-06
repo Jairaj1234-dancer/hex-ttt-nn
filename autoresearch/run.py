@@ -91,6 +91,18 @@ def run_experiment():
 
     metric = float(match.group(1))
     print(f"\nExtracted metric: {metric:.4f}")
+
+    # Save per-experiment checkpoint (train.py saves to last_experiment.pt)
+    last_ckpt = AUTORESEARCH_DIR / "last_experiment.pt"
+    if last_ckpt.exists():
+        import shutil
+        exp_id = get_next_experiment_id()
+        ckpt_dir = AUTORESEARCH_DIR.parent / "checkpoints" / "autoresearch"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_path = ckpt_dir / f"exp{exp_id:03d}_{metric:.3f}.pt"
+        shutil.copy2(str(last_ckpt), str(ckpt_path))
+        print(f"Checkpoint saved: {ckpt_path.name}")
+
     return metric, stdout
 
 
